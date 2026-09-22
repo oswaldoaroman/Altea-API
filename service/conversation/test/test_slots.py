@@ -286,3 +286,31 @@ def test_presion_invertida_no_se_extrae():
 def test_peso_con_coma_decimal():
     slots = slots_a_dict(extraer_slots("peso 76,5"))
     assert slots.get("peso") == 76.5
+
+# ==========================================================
+# EDAD
+# ==========================================================
+
+@pytest.mark.parametrize(
+    "texto, esperado",
+    [
+        ("Tengo 30 años", 30),
+        ("30 años", 30),
+        ("Mi edad es 45", 45),
+        ("edad 50", 50),
+        ("tengo 25 años", 25),
+    ],
+)
+def test_edad(texto, esperado):
+    slots = slots_a_dict(extraer_slots(texto))
+    assert slots.get("edad") == esperado
+
+
+def test_edad_fuera_de_rango_no_se_extrae():
+    slots = slots_a_dict(extraer_slots("Tengo 200 años"))
+    assert "edad" not in slots
+
+
+def test_edad_decimal_no_se_extrae():
+    slots = slots_a_dict(extraer_slots("Tengo 30.5 años"))
+    assert "edad" not in slots

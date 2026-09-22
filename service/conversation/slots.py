@@ -178,6 +178,17 @@ _COLESTEROL_PATTERNS = [
     re.compile(rf"{_NUM}\s*(?:mg/dl|de\s+colesterol)", re.IGNORECASE),
 ]
 
+# ==========================================================
+# EDAD
+# ==========================================================
+# "Tengo 30 años", "30 años", "Mi edad es 30",
+# "Tengo 30", "Tengo 30 de edad"
+_EDAD_PATTERNS = [
+    re.compile(rf"\btengo\s+{_NUM}\s*años", re.IGNORECASE),
+    re.compile(rf"\bmi\s+edad\s+es\s+{_NUM}", re.IGNORECASE),
+    re.compile(rf"\bedad\b\s*(?:es|de|:)?\s*{_NUM}", re.IGNORECASE),
+    re.compile(rf"{_NUM}\s*años\b", re.IGNORECASE),
+]
 
 # ==========================================================
 # API PÚBLICA
@@ -263,6 +274,14 @@ def extraer_slots(texto: str) -> list[Slot]:
     colesterol = _extraer_colesterol(texto)
     if colesterol is not None:
         slots.append(("colesterol", colesterol))
+
+    # ------------------------------------------------------
+    # EDAD
+    # ------------------------------------------------------
+
+    edad = _extraer_edad(texto)
+    if edad is not None:
+        slots.append(("edad", edad))
 
     # ------------------------------------------------------
     # VALIDACIÓN FINAL
@@ -397,4 +416,17 @@ def _extraer_colesterol(texto: str) -> float | None:
             valor = _normalizar_numero(match.group(1))
             if 50 <= valor <= 500:
                 return valor
+    return None
+
+def _extraer_edad(texto: str) -> int | None:
+    for pattern in _EDAD_PATTERNS:
+        match = pattern.search(texto)
+        if match:
+            valor = _normalizar_numero(match.group(1))
+            # Solo enteros.
+            if not valor.is_integer():
+                continue
+            edad = int(valor)
+            if 0 <= edad <= 120:
+                return edad
     return None

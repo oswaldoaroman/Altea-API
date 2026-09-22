@@ -16,10 +16,6 @@ from __future__ import annotations
 from typing import Any
 
 
-# ==========================================================
-# CAMPOS
-# ==========================================================
-
 CAMPOS_EVALUACION = {
     "fuma",
     "consumeAlcohol",
@@ -30,6 +26,7 @@ CAMPOS_EVALUACION = {
     "colesterol",
     "peso",
     "altura",
+    "edad",
 }
 
 
@@ -43,12 +40,14 @@ CAMPOS_REQUERIDOS = {
     "colesterol",
     "peso",
     "altura",
+    "edad",
 }
 
 
 CAMPOS_BOOLEANOS = {"fuma", "consumeAlcohol"}
 
-CAMPOS_ENTEROS = {"actividadFisica"}  # glucosa/colesterol ahora pueden ser float
+# edad y actividadFisica son enteros.
+CAMPOS_ENTEROS = {"actividadFisica", "edad"}
 
 CAMPOS_DECIMALES = {
     "presionSistolica",
@@ -58,7 +57,6 @@ CAMPOS_DECIMALES = {
     "glucosa",
     "colesterol",
 }
-
 
 # ==========================================================
 # VALIDACIÓN
@@ -97,9 +95,13 @@ def validar_dato(
     if field in CAMPOS_ENTEROS:
         if isinstance(value, bool) or not isinstance(value, int):
             return False, None, f"El campo '{field}' debe ser entero."
-        if value < 0:
-            return False, None, f"El campo '{field}' no puede ser negativo."
-        return True, value, None
+    if value < 0:
+        return False, None, f"El campo '{field}' no puede ser negativo."
+    # Rango específico para la edad.
+    if field == "edad" and value > 120:
+        return False, None, "La edad no puede superar los 120 años."
+
+    return True, value, None
 
     # ------------------------------------------------------
     # Decimales
