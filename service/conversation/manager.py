@@ -14,6 +14,11 @@ REGLA DE ORO:
 
 Los eventos que emite coinciden exactamente con el protocolo WS
 definido en el diseño.
+
+IMPORTANTE:
+- Las preguntas de evaluación son PREDEFINIDAS.
+- El LLM NO se usa para generar preguntas de slots.
+- El LLM solo se usa para chat libre.
 """
 
 from __future__ import annotations
@@ -21,12 +26,15 @@ from __future__ import annotations
 import re
 from typing import Any, AsyncIterator
 
-from service import (
+from service.machine_state import (
     ConversationEvent,
     ConversationState,
     InvalidTransitionError,
     StateMachine,
 )
+
+from service.evaluation.engine import evaluar
+from service.evaluation.models import EvaluationInput
 
 from .fallbacks import (
     categoria_colesterol,
@@ -37,13 +45,9 @@ from .fallbacks import (
 from .prompts import (
     SYSTEM_PROMPT_BASE,
     prompt_chat,
-    prompt_preguntar_slot,
 )
 from .slots import extraer_slots
 from .validators import CAMPOS_REQUERIDOS, validar_dato
-
-from service.evaluation.engine import evaluar
-from service.evaluation.models import EvaluationInput
 
 
 # ==========================================================
@@ -67,7 +71,11 @@ ORDEN_CAMPOS = [
 # Máximo de reintentos por campo antes de usar fallback.
 MAX_REINTENTOS = 2
 
-# Patrones que indican que el usuario no sabe un dato.
+
+# ==========================================================
+# PATRONES
+# ==========================================================
+
 _NO_SE_PATTERNS = [
     re.compile(r"\bno\s+s[eé]\b", re.IGNORECASE),
     re.compile(r"\bno\s+me\s+acuerdo\b", re.IGNORECASE),
@@ -78,7 +86,6 @@ _NO_SE_PATTERNS = [
     re.compile(r"\bni\s+idea\b", re.IGNORECASE),
 ]
 
-# Patrones que indican intención de iniciar evaluación.
 _INTENCION_EVALUACION = [
     re.compile(r"\bquiero\s+evaluar(me)?\b", re.IGNORECASE),
     re.compile(r"\bquiero\s+saber\s+mi\s+riesgo\b", re.IGNORECASE),
@@ -87,6 +94,57 @@ _INTENCION_EVALUACION = [
     re.compile(r"\bcomenzar\s+(la\s+)?evaluaci[oó]n\b", re.IGNORECASE),
     re.compile(r"\bquiero\s+conocer\s+mi\s+riesgo\b", re.IGNORECASE),
 ]
+
+
+# ==========================================================
+# PREGUNTAS PREDEFINIDAS
+# ==========================================================
+
+PREGUNTAS_PREDEFINIDAS: dict[str, str] = {
+    "peso": "¿Cuál es tu peso en kilogramos?",
+    "altura": "¿Cuál es tu altura? Puedes decirme en centímetros o metros.",
+    "edad": "¿Cuántos años tienes?",
+    "presionSistolica": (
+        "¿Conoces tu presión arterial? Puedes decirme algo como "
+        "'130 sobre 85'. Si no la sabes, dime 'no sé'."
+    ),
+    "presionDiastolica": (
+        "¿Y el segundo valor de tu presión? Por ejemplo, si tu presión "
+        "es 130 sobre 85, el segundo valor es 85."
+    ),
+    "fuma": "¿Fumas actualmente?",
+    "consumeAlcohol": "¿Consumes alcohol?",
+    "actividadFisica": (
+        "¿Haces actividad física? Puedes responder 'activo', "
+        "'moderado' o 'sedentario'."
+    ),
+    "glucosa": (
+        "¿Conoces tu nivel de glucosa en sangre? Si no, dime 'no sé'."
+    ),
+    "colesterol": (
+        "¿Conoces tu nivel de colesterol? Si no, dime 'no sé'."
+    ),
+}
+
+
+PREGUNTAS_CATEGORIA: dict[str, str] = {
+    "presionSistolica": (
+        "No hay problema. ¿Crees que tu presión arterial es baja, "
+        "normal o alta?"
+    ),
+    "presionDiastolica": (
+        "No hay problema. ¿Crees que tu presión arterial es baja, "
+        "normal o alta?"
+    ),
+    "glucosa": (
+        "No hay problema. ¿Crees que tu glucosa está normal, "
+        "elevada o alta?"
+    ),
+    "colesterol": (
+        "No hay problema. ¿Crees que tu colesterol está normal, "
+        "elevado o alto?"
+    ),
+}
 
 
 # ==========================================================
@@ -125,10 +183,6 @@ class ConversationManager:
         En v1 no se persiste; solo se guarda.
         """
         self.user_id = user_id
-
-        # No emitimos nada especial. El cliente sabe que envió
-        # el session_init y no espera respuesta. Pero respetamos
-        # el "done" al final del turno.
         yield {"type": "done"}
 
     async def handle_start_evaluation(self) -> AsyncIterator[dict]:
@@ -157,18 +211,15 @@ class ConversationManager:
             return
 
         content = content.strip()
-
-        # Guardar en historial.
         self.historial.append({"role": "usuario", "content": content})
 
-        # Si estamos en EVALUATION, procesamos el mensaje como
-        # posible slot.
+        # En evaluación: procesar como posible slot.
         if self.fsm.state == ConversationState.EVALUATION:
             async for evento in self._procesar_mensaje_evaluacion(content):
                 yield evento
             return
 
-        # Si estamos en COMPLETED, volvemos a IDLE.
+        # En COMPLETED: volver a IDLE.
         if self.fsm.state == ConversationState.COMPLETED:
             try:
                 self.fsm.handle(ConversationEvent.USER_TEXT)
@@ -198,11 +249,9 @@ class ConversationManager:
     # ======================================================
 
     async def _iniciar_evaluacion(self) -> AsyncIterator[dict]:
-        # Transición FSM.
         try:
             self.fsm.handle(ConversationEvent.USER_START_EVAL)
         except InvalidTransitionError:
-            # Ya estábamos en EVALUATION. Reiniciamos.
             self.fsm.reset()
             self.fsm.handle(ConversationEvent.USER_START_EVAL)
 
@@ -213,7 +262,6 @@ class ConversationManager:
             "required_fields": list(CAMPOS_REQUERIDOS),
         }
 
-        # Preguntar el primer campo.
         async for evento in self._preguntar_siguiente_campo():
             yield evento
 
@@ -227,27 +275,25 @@ class ConversationManager:
         self,
         content: str,
     ) -> AsyncIterator[dict]:
-        # --------------------------------------------------
-        # 1. Detectar "no sé" para el campo que estábamos pidiendo.
-        # --------------------------------------------------
-
         campo_pendiente = self._siguiente_campo()
 
+        # 1. Detectar "no sé".
         if self._detectar_no_se(content) and campo_pendiente:
             async for evento in self._manejar_no_se(campo_pendiente):
                 yield evento
             return
 
-        # --------------------------------------------------
-        # 2. Extraer slots del texto.
-        # --------------------------------------------------
-
+        # 2. Extraer slots.
         slots_extraidos = self._extraer_y_validar(content)
 
         if not slots_extraidos:
-            # No hay slot. Puede ser una respuesta a una pregunta
-            # de categoría (por ejemplo, "creo que normal").
-            if campo_pendiente in ("presionSistolica", "glucosa", "colesterol"):
+            # Puede ser una respuesta de categoría.
+            if campo_pendiente in (
+                "presionSistolica",
+                "presionDiastolica",
+                "glucosa",
+                "colesterol",
+            ):
                 async for evento in self._intentar_parsear_categoria(
                     content, campo_pendiente
                 ):
@@ -259,15 +305,11 @@ class ConversationManager:
                 yield evento
             return
 
-        # --------------------------------------------------
-        # 3. Aplicar slots extraídos.
-        # --------------------------------------------------
-
+        # 3. Aplicar slots.
         for field, value in slots_extraidos:
             self.slots[field] = value
             self.reintentos[field] = 0
 
-        # Emitir evaluation_data por cada slot.
         for field, value in slots_extraidos:
             yield {
                 "type": "evaluation_data",
@@ -277,19 +319,13 @@ class ConversationManager:
                 "total": len(CAMPOS_REQUERIDOS),
             }
 
-        # --------------------------------------------------
-        # 4. ¿Está completa?
-        # --------------------------------------------------
-
+        # 4. ¿Completa?
         if self._evaluacion_completa():
             async for evento in self._finalizar_evaluacion():
                 yield evento
             return
 
-        # --------------------------------------------------
-        # 5. Preguntar el siguiente campo.
-        # --------------------------------------------------
-
+        # 5. Preguntar siguiente.
         async for evento in self._preguntar_siguiente_campo():
             yield evento
 
@@ -299,15 +335,17 @@ class ConversationManager:
     # MANEJO DE "NO SÉ"
     # ======================================================
 
-    async def _manejar_no_se(
-        self,
-        campo: str,
-    ) -> AsyncIterator[dict]:
-        # Si el campo tiene categoría (presion, glucosa, colesterol),
-        # preguntamos por categoría.
-        if campo in ("presionSistolica", "glucosa", "colesterol"):
-            prompt = self._prompt_preguntar_categoria(campo)
-            texto = await self._llamar_llm_libre(prompt)
+    async def _manejar_no_se(self, campo: str) -> AsyncIterator[dict]:
+        """
+        El usuario dijo "no sé" para un campo.
+
+        - Si el campo tiene categoría (presión, glucosa, colesterol),
+          se le pregunta por categoría.
+        - Si no, se aplica el fallback sintético directo.
+        """
+
+        if campo in PREGUNTAS_CATEGORIA:
+            texto = PREGUNTAS_CATEGORIA[campo]
 
             self.historial.append({"role": "altea", "content": texto})
 
@@ -338,18 +376,17 @@ class ConversationManager:
             categoria = parsear_categoria(content, "colesterol")
 
         if categoria is None:
-            # No es categoría ni slot. Reintentar.
             async for evento in self._reintentar_o_fallback(campo_pendiente):
                 yield evento
             return
 
-        # Aplicar la categoría al campo correspondiente.
+        # Presión: ambos valores a la vez.
         if campo_pendiente in ("presionSistolica", "presionDiastolica"):
-            # Ambos se llenan a la vez con el fallback.
             async for evento in self._aplicar_fallback_presion(categoria):
                 yield evento
             return
 
+        # Glucosa / colesterol.
         if campo_pendiente == "glucosa":
             self.slots["glucosa"] = float(categoria)
             self.reintentos["glucosa"] = 0
@@ -371,7 +408,6 @@ class ConversationManager:
                 "total": len(CAMPOS_REQUERIDOS),
             }
 
-        # Continuar.
         if self._evaluacion_completa():
             async for evento in self._finalizar_evaluacion():
                 yield evento
@@ -396,7 +432,7 @@ class ConversationManager:
                 yield evento
             return
 
-        # Glucosa y colesterol: default categoría 2 (elevado).
+        # Glucosa / colesterol: default categoría 2 (elevado).
         if campo == "glucosa":
             self.slots["glucosa"] = 2.0
             yield {
@@ -424,8 +460,26 @@ class ConversationManager:
                 "progress": self._contar_llenos(),
                 "total": len(CAMPOS_REQUERIDOS),
             }
+        else:
+            # Otros campos: valor genérico para no bloquear.
+            # (peso, altura, fuma, consumeAlcohol, actividadFisica)
+            defaults = {
+                "peso": 70.0,
+                "altura": 170.0,
+                "fuma": False,
+                "consumeAlcohol": False,
+                "actividadFisica": 1,
+            }
+            if campo in defaults:
+                self.slots[campo] = defaults[campo]
+                yield {
+                    "type": "evaluation_data",
+                    "field": campo,
+                    "value": defaults[campo],
+                    "progress": self._contar_llenos(),
+                    "total": len(CAMPOS_REQUERIDOS),
+                }
 
-        # Continuar.
         if self._evaluacion_completa():
             async for evento in self._finalizar_evaluacion():
                 yield evento
@@ -482,7 +536,6 @@ class ConversationManager:
         campo: str | None,
     ) -> AsyncIterator[dict]:
         if campo is None:
-            # No hay campo pendiente. Volver a preguntar el primero faltante.
             async for evento in self._preguntar_siguiente_campo():
                 yield evento
             yield {"type": "done"}
@@ -495,9 +548,11 @@ class ConversationManager:
                 yield evento
             return
 
-        # Repetir la pregunta del mismo campo.
-        texto = await self._llm_preguntar_campo(campo)
+        # Repetir pregunta del mismo campo (predefinida, sin LLM).
+        texto = self._preguntar_campo(campo)
+
         self.historial.append({"role": "altea", "content": texto})
+
         yield {"type": "assistant_message", "content": texto}
         yield {"type": "done"}
 
@@ -511,7 +566,6 @@ class ConversationManager:
         except InvalidTransitionError:
             pass
 
-        # Construir input.
         try:
             inp = self._construir_input()
         except Exception as e:
@@ -523,13 +577,10 @@ class ConversationManager:
             yield {"type": "done"}
             return
 
-        # Edad (parámetro aparte).
         edad = float(self.slots.get("edad") or 30)
 
-        # Llamar al motor.
         result = evaluar(inp, edad)
 
-        # Transición.
         try:
             self.fsm.handle(ConversationEvent.ENGINE_DONE)
         except InvalidTransitionError:
@@ -553,7 +604,7 @@ class ConversationManager:
         if campo is None:
             return
 
-        texto = await self._llm_preguntar_campo(campo)
+        texto = self._preguntar_campo(campo)
 
         self.historial.append({"role": "altea", "content": texto})
 
@@ -586,31 +637,28 @@ class ConversationManager:
         yield {"type": "done"}
 
     # ======================================================
-    # LLAMADAS AL LLM
+    # PREGUNTA PREDEFINIDA
     # ======================================================
 
-    async def _llm_preguntar_campo(self, campo: str) -> str:
-        prompt = prompt_preguntar_slot(
-            field=campo,
-            datos_ya={k: v for k, v in self.slots.items() if v is not None},
-            historial=self.historial,
+    def _preguntar_campo(self, campo: str) -> str:
+        """
+        Devuelve la pregunta predefinida para un campo.
+
+        No llama al LLM. Las preguntas de evaluación son cerradas
+        y siempre las mismas.
+        """
+        return PREGUNTAS_PREDEFINIDAS.get(
+            campo,
+            f"¿Cuál es tu {campo}?",
         )
 
-        try:
-            return await self.llm.generate(prompt, SYSTEM_PROMPT_BASE)
-        except Exception:
-            # Fallback simple si el LLM falla.
-            return self._pregunta_generica(campo)
+    # ======================================================
+    # LLAMADAS AL LLM
+    # ======================================================
 
     async def _llm_chat_libre(self, content: str) -> str:
         prompt = prompt_chat(mensaje=content, historial=self.historial)
         return await self.llm.generate(prompt, SYSTEM_PROMPT_BASE)
-
-    async def _llamar_llm_libre(self, prompt: str) -> str:
-        try:
-            return await self.llm.generate(prompt, SYSTEM_PROMPT_BASE)
-        except Exception:
-            return "¿Cómo crees que está: normal, elevada o alta?"
 
     # ======================================================
     # HELPERS
@@ -623,9 +671,7 @@ class ConversationManager:
         )
 
     def _contar_llenos(self) -> int:
-        return sum(
-            1 for v in self.slots.values() if v is not None
-        )
+        return sum(1 for v in self.slots.values() if v is not None)
 
     def _siguiente_campo(self) -> str | None:
         for campo in ORDEN_CAMPOS:
@@ -654,7 +700,6 @@ class ConversationManager:
         return resultado
 
     def _construir_input(self) -> EvaluationInput:
-        # Presión: puede faltar si por alguna razón no se llenó.
         ap_hi = self.slots.get("presionSistolica")
         ap_lo = self.slots.get("presionDiastolica")
 
@@ -663,11 +708,9 @@ class ConversationManager:
             peso = self.slots.get("peso") or 70.0
             ap_hi, ap_lo = convertir_presion(2, edad, peso)
 
-        # Glucosa y colesterol: convertir a categoría.
         gluc_raw = self.slots.get("glucosa") or 100.0
         chol_raw = self.slots.get("colesterol") or 180.0
 
-        # Si el valor ya es categoría (1, 2, 3), respetarlo.
         gluc = self._normalizar_categoria(gluc_raw, "glucosa")
         chol = self._normalizar_categoria(chol_raw, "colesterol")
 
@@ -688,7 +731,6 @@ class ConversationManager:
         valor: float,
         campo: str,
     ) -> float:
-        # Si está entre 1 y 3, ya es categoría.
         if 1.0 <= valor <= 3.0:
             return float(valor)
 
@@ -699,27 +741,3 @@ class ConversationManager:
             return categoria_colesterol(valor)
 
         return valor
-
-    def _prompt_preguntar_categoria(self, campo: str) -> str:
-        if campo == "glucosa":
-            return "Pregúntale al usuario, de forma amable, si cree que su glucosa está normal, elevada o alta. Una sola pregunta breve."
-        if campo == "colesterol":
-            return "Pregúntale al usuario, de forma amable, si cree que su colesterol está normal, elevado o alto. Una sola pregunta breve."
-        if campo in ("presionSistolica", "presionDiastolica"):
-            return "Pregúntale al usuario, de forma amable, si cree que su presión arterial está baja, normal o alta. Una sola pregunta breve."
-        return "Pide al usuario el dato que falta de forma amable."
-
-    def _pregunta_generica(self, campo: str) -> str:
-        preguntas = {
-            "peso": "¿Cuál es tu peso en kilogramos?",
-            "altura": "¿Cuál es tu altura en centímetros?",
-            "edad": "¿Cuántos años tienes?",
-            "presionSistolica": "¿Cuál es tu presión arterial?",
-            "presionDiastolica": "¿Y tu presión diastólica?",
-            "fuma": "¿Fumas?",
-            "consumeAlcohol": "¿Consumes alcohol?",
-            "actividadFisica": "¿Haces actividad física?",
-            "glucosa": "¿Conoces tu nivel de glucosa?",
-            "colesterol": "¿Conoces tu nivel de colesterol?",
-        }
-        return preguntas.get(campo, "Cuéntame más.")
