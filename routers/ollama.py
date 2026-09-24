@@ -47,7 +47,6 @@ _llm_client = OllamaClient(
 @router.websocket("/ws")
 async def ollama_websocket(websocket: WebSocket):
     await websocket.accept()
-    print("Cliente WebSocket conectado.")
 
     # Un manager por conexión.
     manager = ConversationManager(llm=_llm_client)
@@ -123,10 +122,10 @@ async def ollama_websocket(websocket: WebSocket):
                     })
                     await websocket.send_json({"type": "done"})
 
-            except Exception as e:
+            except Exception:
                 # Error inesperado procesando el turno.
-                print(f"Error procesando turno: {e}")
-
+                # El cliente recibe un error genérico para no filtrar
+                # información interna.
                 await websocket.send_json({
                     "type": "error",
                     "code": "internal_error",
@@ -135,10 +134,11 @@ async def ollama_websocket(websocket: WebSocket):
                 await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
-        print("Cliente WebSocket desconectado.")
+        # El cliente se desconectó. No hay nada que hacer.
+        pass
 
-    except Exception as e:
-        print(f"Error WebSocket: {e}")
-
-    finally:
-        print("Conexión WebSocket finalizada.")
+    except Exception:
+        # Error no esperado en el bucle principal.
+        # No relanzamos para evitar que uvicorn cierre la conexión
+        # de forma abrupta si es un error recuperable.
+        pass
