@@ -1,162 +1,144 @@
+"""
+Router WebSocket para el chatbot.
+
+Este router es DELGADO. Solo:
+- Acepta conexiones WebSocket.
+- Parsea JSON entrante.
+- Delega al ConversationManager.
+- Envía eventos al cliente.
+- Maneja desconexiones.
+
+Toda la lógica de negocio vive en service/conversation/manager.py.
+"""
+
+from __future__ import annotations
+
 import json
 
-import httpx
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from database.ollama_config import OLLAMA_URL, OLLAMA_MODEL, SYSTEM_PROMPT
+
+from database.ollama_config import OLLAMA_MODEL, OLLAMA_URL
+from service.conversation.manager import ConversationManager
+from service.llm import OllamaClient
+
 
 router = APIRouter(
     prefix="/ollama",
-    tags=["Ollama"]
+    tags=["Ollama"],
 )
+
+
+# ==========================================================
+# CLIENTE COMPARTIDO
+# ==========================================================
+
+# Un único cliente de Ollama para toda la app.
+# No tiene estado mutable, se puede reutilizar sin problema.
+_llm_client = OllamaClient(
+    url=OLLAMA_URL,
+    model=OLLAMA_MODEL,
+)
+
+
+# ==========================================================
+# WEBSOCKET
+# ==========================================================
 
 @router.websocket("/ws")
 async def ollama_websocket(websocket: WebSocket):
-
     await websocket.accept()
 
-    print("Cliente WebSocket conectado.")
+    # Un manager por conexión.
+    manager = ConversationManager(llm=_llm_client)
 
     try:
-
         while True:
+            # ----------------------------------------------
+            # Recibir mensaje
+            # ----------------------------------------------
 
-            # ------------------------------------------------
-            # Recibir mensaje desde Flutter
-            # ------------------------------------------------
+            raw = await websocket.receive_text()
 
-            message = await websocket.receive_text()
+            # ----------------------------------------------
+            # Parsear JSON
+            # ----------------------------------------------
 
             try:
-                data = json.loads(message)
-
+                data = json.loads(raw)
             except json.JSONDecodeError:
-
                 await websocket.send_json({
                     "type": "error",
-                    "message": "El mensaje recibido no es JSON válido."
+                    "code": "invalid_message",
+                    "message": "El mensaje no es JSON válido.",
                 })
-
+                await websocket.send_json({"type": "done"})
                 continue
 
-            prompt = data.get("prompt")
+            # ----------------------------------------------
+            # Validar tipo
+            # ----------------------------------------------
 
-            if not prompt:
+            tipo = data.get("type")
 
+            if not isinstance(tipo, str):
                 await websocket.send_json({
                     "type": "error",
-                    "message": "El prompt no puede estar vacío."
+                    "code": "invalid_message",
+                    "message": "Falta el campo 'type'.",
                 })
-
+                await websocket.send_json({"type": "done"})
                 continue
 
-            # ------------------------------------------------
-            # Preparar petición a Ollama
-            # ------------------------------------------------
-
-            payload = {
-                "model": OLLAMA_MODEL,
-
-                # IMPORTANTE:
-                # Mantiene la personalidad de Altea
-                "system": SYSTEM_PROMPT,
-
-                "prompt": prompt,
-                "stream": True
-            }
-
-            # ------------------------------------------------
-            # Conectarse a Ollama
-            # ------------------------------------------------
+            # ----------------------------------------------
+            # Delegar al manager
+            # ----------------------------------------------
 
             try:
+                if tipo == "chat":
+                    content = data.get("content", "")
+                    if not isinstance(content, str):
+                        content = ""
 
-                async with httpx.AsyncClient(timeout=None) as client:
+                    async for evento in manager.handle_chat(content):
+                        await websocket.send_json(evento)
 
-                    async with client.stream(
-                        "POST",
-                        OLLAMA_URL,
-                        json=payload
-                    ) as response:
+                elif tipo == "start_evaluation":
+                    async for evento in manager.handle_start_evaluation():
+                        await websocket.send_json(evento)
 
-                        if response.status_code != 200:
+                elif tipo == "session_init":
+                    user_id = data.get("user_id")
+                    if user_id is not None and not isinstance(user_id, str):
+                        user_id = None
 
-                            error_body = await response.aread()
+                    async for evento in manager.handle_session_init(user_id):
+                        await websocket.send_json(evento)
 
-                            await websocket.send_json({
-                                "type": "error",
-                                "message": (
-                                    "Error de Ollama: "
-                                    f"{error_body.decode()}"
-                                )
-                            })
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "code": "invalid_message",
+                        "message": f"Tipo de mensaje desconocido: '{tipo}'.",
+                    })
+                    await websocket.send_json({"type": "done"})
 
-                            continue
-
-                        # ------------------------------------
-                        # Leer streaming de Ollama
-                        # ------------------------------------
-
-                        async for line in response.aiter_lines():
-
-                            if not line:
-                                continue
-
-                            try:
-
-                                ollama_data = json.loads(line)
-
-                            except json.JSONDecodeError:
-
-                                continue
-
-                            # --------------------------------
-                            # Obtener fragmento
-                            # --------------------------------
-
-                            chunk = ollama_data.get(
-                                "response",
-                                ""
-                            )
-
-                            if chunk:
-
-                                await websocket.send_json({
-                                    "type": "chunk",
-                                    "content": chunk
-                                })
-
-                            # --------------------------------
-                            # Ollama terminó
-                            # --------------------------------
-
-                            if ollama_data.get("done") is True:
-
-                                await websocket.send_json({
-                                    "type": "done"
-                                })
-
-                                break
-
-            except Exception as e:
-
-                print(
-                    f"Error comunicándose con Ollama: {e}"
-                )
-
+            except Exception:
+                # Error inesperado procesando el turno.
+                # El cliente recibe un error genérico para no filtrar
+                # información interna.
                 await websocket.send_json({
                     "type": "error",
-                    "message": "No se pudo comunicar con Ollama."
+                    "code": "internal_error",
+                    "message": "Ocurrió un error procesando el mensaje.",
                 })
+                await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
+        # El cliente se desconectó. No hay nada que hacer.
+        pass
 
-        print("Cliente WebSocket desconectado.")
-
-    except Exception as e:
-
-        print(f"Error WebSocket: {e}")
-
-    finally:
-
-        print("Conexión WebSocket finalizada.")
-
+    except Exception:
+        # Error no esperado en el bucle principal.
+        # No relanzamos para evitar que uvicorn cierre la conexión
+        # de forma abrupta si es un error recuperable.
+        pass
